@@ -105,10 +105,19 @@ function mainMenu() {
 }
 function backButton() { return Markup.inlineKeyboard([[Markup.button.callback("Back", "menu:main")]]); }
 function cancelButton() { return Markup.inlineKeyboard([[Markup.button.callback("Cancel ❌", "flow:cancel")]]); }
+async function safeAnswer(ctx, text = "") {
+  if (ctx.callbackQuery) await ctx.answerCbQuery(text).catch(() => {});
+}
+async function removeInlineButtons(ctx) {
+  if (ctx.callbackQuery) await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+}
 async function showMenu(ctx, text = "Main Menu") {
-  const extra = mainMenu();
-  if (ctx.callbackQuery) return ctx.editMessageText(text, extra).catch(() => ctx.reply(text, extra));
-  return ctx.reply(text, extra);
+  await safeAnswer(ctx);
+  if (ctx.callbackQuery) {
+    await removeInlineButtons(ctx);
+    return ctx.reply(text, mainMenu()).catch(() => {});
+  }
+  return ctx.reply(text, mainMenu()).catch(() => {});
 }
 async function tell(ctx, text, extra = {}) { return ctx.reply(text, extra); }
 function setState(type, data = {}) { states.set(ADMIN_ID, { type, ...data }); }
@@ -224,7 +233,13 @@ async function runJoin(name, links) {
   }
 }
 
+bot.use(async (ctx, next) => {
+  try { await safeAnswer(ctx); } catch (_) {}
+  return next();
+});
 bot.catch((err, ctx) => { console.error("Telegram handler error", { updateId: ctx.update?.update_id, message: err.message, stack: err.stack }); });
+process.on("unhandledRejection", err => console.error("Unhandled promise rejection", err));
+process.on("uncaughtException", err => console.error("Uncaught exception (kept alive)", err));
 bot.start(adminOnly, ctx => showMenu(ctx, "👋 GP Auto Sender Bot\n\nMain Menu ကိုရွေးပါ။"));
 bot.command("send", adminOnly, async ctx => {
   const arg = ctx.message.text.split(/\s+/)[1]?.toLowerCase();
@@ -273,7 +288,12 @@ bot.action("menu:stop", adminOnly, async ctx => {
   if (stopPresses >= 2) { cooldownUntil = now + STOP_COOLDOWN_MS; stopPresses = 0; return tell(ctx, "⏹️ Stop လုပ်ပြီးပါပြီ။ 20 မိနစ် cooldown ထားထားသည်။", backButton()); }
   tell(ctx, "⏹️ Stop တောင်းဆိုပြီးပါပြီ။ ထပ်မံနှိပ်လျှင် 20 မိနစ် cooldown ထားမည်။", backButton());
 });
-bot.action("flow:cancel", adminOnly, async ctx => { clearState(); tell(ctx, "❌ ပယ်ဖျက်ပြီးပါပြီ။", mainMenu()); });
+bot.action("flow:cancel", adminOnly, async ctx => {
+  clearState();
+  await safeAnswer(ctx, "Cancelled");
+  await removeInlineButtons(ctx);
+  return tell(ctx, "❌ ပယ်ဖျက်ပြီးပါပြီ။ Main Menu ကို ပြန်သုံးနိုင်ပါပြီ။", mainMenu()).catch(() => {});
+});
 bot.action("flow:completed", adminOnly, async ctx => { const s = currentState(); if (!s || s.type !== "acc_msg") return; clearState(); tell(ctx, "✅ Message ပြင်ဆင်ပြီးပါပြီ။", mainMenu()); });
 
 async function receiveSession(ctx, text) {
