@@ -3,6 +3,7 @@ const { TelegramClient } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const { Api } = require("telegram/tl");
 const { MongoClient } = require("mongodb");
+const crypto = require("crypto");
 require("dotenv").config();
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -10,15 +11,35 @@ const API_ID = Number(process.env.API_ID);
 const API_HASH = process.env.API_HASH;
 const ADMIN_ID = Number(process.env.ADMIN_ID);
 const MONGO_URI = process.env.MONGO_URI;
+const SESSION_ENCRYPTION_KEY = process.env.SESSION_ENCRYPTION_KEY;
 const PORT = Number(process.env.PORT || 3000);
 const MAX_ACCOUNTS = 10;
 const GP_DELAY_MS = 6000;
 const SEND_COOLDOWN_MS = 15 * 60 * 1000;
 const STOP_COOLDOWN_MS = 20 * 60 * 1000;
 
-if (!BOT_TOKEN || !API_ID || !API_HASH || !ADMIN_ID || !MONGO_URI) {
-  throw new Error("BOT_TOKEN, API_ID, API_HASH, ADMIN_ID and MONGO_URI are required");
+if (!BOT_TOKEN || !API_ID || !API_HASH || !ADMIN_ID || !MONGO_URI || !SESSION_ENCRYPTION_KEY) {
+  throw new Error("BOT_TOKEN, API_ID, API_HASH, ADMIN_ID, MONGO_URI and SESSION_ENCRYPTION_KEY are required");
 }
+const KEY = crypto.createHash("sha256").update(SESSION_ENCRYPTION_KEY).digest();
+function encrypt(value) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", KEY, iv);
+  const encrypted = Buffer.concat([cipher.update(String(value), "utf8"), cipher.final()]);
+  return `${iv.toString("base64url")}.${cipher.getAuthTag().toString("base64url")}.${encrypted.toString("base64url")}`;
+}
+function decrypt(value) {
+  if (!value) return "";
+  const [ivB64, tagB64, dataB64] = String(value).split(".");
+  if (!ivB64 || !tagB64 || !dataB64) return String(value);
+  try {
+    const decipher = crypto.createDecipheriv("aes-256-gcm", KEY, Buffer.from(ivB64, "base64url"));
+    decipher.setAuthTag(Buffer.from(tagB64, "base64url"));
+    return Buffer.concat([decipher.update(Buffer.from(dataB64, "base64url")), decipher.final()]).toString("utf8");
+  } catch { throw new Error("Encrypted account data cannot be decrypted; check SESSION_ENCRYPTION_KEY"); }
+}
+function encryptJson(value) { return encrypt(JSON.stringify(value || [])); }
+function decryptJson(value) { try { return JSON.parse(decrypt(value)); } catch { return Array.isArray(value) ? value : []; } }
 
 const bot = new Telegraf(BOT_TOKEN);
 let db;
@@ -33,7 +54,11 @@ let lastStopAt = 0;
 let cooldownUntil = 0;
 
 const isAdmin = ctx => Number(ctx.from?.id) === ADMIN_ID;
-const adminOnly = (ctx, next) => isAdmin(ctx) ? next() : undefined;
+const adminOnly = async (ctx, next) => {
+  if (isAdmin(ctx)) return next();
+  console.warn(`Unauthorized Telegram user ${ctx.from?.id}; configured ADMIN_ID=${ADMIN_ID}`);
+  if (ctx.message?.text === "/start" || ctx.callbackQuery) await ctx.reply("ဒီ bot ကို admin account သာ အသုံးပြုနိုင်ပါသည်။").catch(() => {});
+};
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function connectDB() {
@@ -41,9 +66,26 @@ async function connectDB() {
   await mongo.connect();
   db = mongo.db("gpbot");
 }
-const accounts = () => db.collection("accounts").find({}).sort({ order: 1, addedAt: 1 }).toArray();
-const accountByName = name => db.collection("accounts").findOne({ name });
-const saveAccount = (name, data) => db.collection("accounts").updateOne({ name }, { $set: data }, { upsert: true });
+async function accounts() {
+  const rows = await db.collection("accounts").find({}).sort({ order: 1, addedAt: 1 }).toArray();
+  return rows.map(a => ({ ...a, sessionString: a.sessionCiphertext ? decrypt(a.sessionCiphertext) : a.sessionString || "", gpLinks: a.gpLinksCiphertext ? decryptJson(a.gpLinksCiphertext) : a.gpLinks || [] }));
+}
+async function accountByName(name) { return (await accounts()).find(a => a.name === name) || null; }
+async function saveAccount(name, data) {
+  const safe = { ...data };
+  if (Object.prototype.hasOwnProperty.call(safe, "sessionString")) { safe.sessionCiphertext = encrypt(safe.sessionString); delete safe.sessionString; }
+  if (Object.prototype.hasOwnProperty.call(safe, "gpLinks")) { safe.gpLinksCiphertext = encryptJson(safe.gpLinks); delete safe.gpLinks; }
+  return db.collection("accounts").updateOne({ name }, { $set: safe, $unset: { sessionString: "", gpLinks: "" } }, { upsert: true });
+}
+async function migrateLegacyAccountData() {
+  const rows = await db.collection("accounts").find({}).toArray();
+  for (const row of rows) {
+    const patch = {};
+    if (row.sessionString && !row.sessionCiphertext) patch.sessionString = row.sessionString;
+    if (Array.isArray(row.gpLinks) && !row.gpLinksCiphertext) patch.gpLinks = row.gpLinks;
+    if (Object.keys(patch).length) await saveAccount(row.name, patch);
+  }
+}
 const settings = () => db.collection("settings").findOne({ _id: "main" }) || {};
 const saveSettings = data => db.collection("settings").updateOne({ _id: "main" }, { $set: data }, { upsert: true });
 
@@ -176,6 +218,7 @@ async function runJoin(name, links) {
   }
 }
 
+bot.catch((err, ctx) => { console.error("Telegram handler error", { updateId: ctx.update?.update_id, message: err.message, stack: err.stack }); });
 bot.start(adminOnly, ctx => showMenu(ctx, "👋 GP Auto Sender Bot\n\nMain Menu ကိုရွေးပါ။"));
 bot.command("send", adminOnly, async ctx => {
   const arg = ctx.message.text.split(/\s+/)[1]?.toLowerCase();
@@ -249,7 +292,21 @@ bot.on("text", adminOnly, async ctx => {
   if (s.type === "acc_msg") { await saveAccount(s.name, { customMsg: text }); clearState(); return tell(ctx, `✅ ${s.name} message သိမ်းပြီးပါပြီ။`, mainMenu()); }
 });
 
-require("http").createServer((_, res) => { res.writeHead(200); res.end("GP Bot OK"); }).listen(PORT);
-(async () => { await connectDB(); const s = await settings(); await loadClients(); if (s.schedulerOn) { scheduledNames = (await accounts()).map(a => a.name); runSend(scheduledNames); } await bot.telegram.deleteWebhook({ drop_pending_updates: true }); await bot.launch({ dropPendingUpdates: true }); await bot.telegram.sendMessage(ADMIN_ID, "✅ Button GP Bot အသင့်ဖြစ်ပြီ။ /start နိပ်ပါ"); })().catch(console.error);
+require("http").createServer((_, res) => { res.writeHead(200); res.end("GP Bot OK"); }).listen(PORT, () => console.log(`HTTP health server listening on ${PORT}`));
+(async () => {
+  console.log("[startup] connecting to MongoDB...");
+  await connectDB();
+  console.log("[startup] MongoDB connected; checking Telegram token...");
+  const me = await bot.telegram.getMe();
+  console.log(`[startup] Telegram bot @${me.username} ready; ADMIN_ID=${ADMIN_ID}`);
+  await migrateLegacyAccountData();
+  const s = await settings();
+  await loadClients();
+  if (s.schedulerOn) { scheduledNames = (await accounts()).map(a => a.name); runSend(scheduledNames); }
+  await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+  await bot.launch({ dropPendingUpdates: true });
+  console.log("[startup] long polling started; waiting for updates");
+  await bot.telegram.sendMessage(ADMIN_ID, "✅ Button GP Bot အသင့်ဖြစ်ပြီ။ /start နိပ်ပါ");
+})().catch(err => { console.error("[startup] FAILED:", err.stack || err.message); process.exitCode = 1; });
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
