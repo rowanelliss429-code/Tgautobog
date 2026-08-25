@@ -83,6 +83,10 @@ async function saveAccount(name, data) {
   if (Object.prototype.hasOwnProperty.call(safe, "gpLinks")) { if (KEY) { safe.gpLinksCiphertext = encryptJson(safe.gpLinks); delete safe.gpLinks; } }
   return db.collection("accounts").updateOne({ name }, { $set: safe, ...(KEY ? { $unset: { sessionString: "", gpLinks: "" } } : {}) }, { upsert: true });
 }
+async function deleteAccount(name) {
+  await db.collection("accounts").deleteOne({ name });
+  await db.collection("sendlogs").deleteMany({ accName: name });
+}
 async function migrateLegacyAccountData() {
   if (!KEY) return;
   const rows = await db.collection("accounts").find({}).toArray();
@@ -221,16 +225,30 @@ async function runSend(names) {
 async function runJoin(name, links) {
   const client = clients.get(name);
   if (!client) return bot.telegram.sendMessage(ADMIN_ID, `❌ ${name} Connected မဟုတ်ပါ`);
+  const accepted = [];
   for (let i = 0; i < links.length; i++) {
-    try { await joinOne(client, links[i]); await bot.telegram.sendMessage(ADMIN_ID, `✅ ${name} GP${i + 1} ပြီးပါပြီ`); }
+    try { await joinOne(client, links[i]); accepted.push(links[i]); await bot.telegram.sendMessage(ADMIN_ID, `✅ ${name} GP${i + 1} ပြီးပါပြီ`); }
     catch (err) {
       const wait = floodWaitSeconds(err);
       if (wait) { await bot.telegram.sendMessage(ADMIN_ID, `⏳ Telegram အမိန့်အတိုင်း ${wait} စက္ကန့်စောင့်ပြီး ဆက်လုပ်မည်`); await sleep(wait * 1000); i--; continue; }
-      if (/already|PARTICIPANT/i.test(err.message)) await bot.telegram.sendMessage(ADMIN_ID, `ℹ️ ${name} GP${i + 1} ဝင်ပြီးသားပါ`);
+      if (/already|PARTICIPANT/i.test(err.message)) { accepted.push(links[i]); await bot.telegram.sendMessage(ADMIN_ID, `ℹ️ ${name} GP${i + 1} ဝင်ပြီးသားပါ`); }
       else await bot.telegram.sendMessage(ADMIN_ID, `❌ ${name} GP${i + 1} မအောင်မြင်ပါ — ${err.message}`);
     }
     if (i < links.length - 1) await sleep(GP_DELAY_MS);
   }
+  if (accepted.length) {
+    const a = await accountByName(name);
+    const merged = [...new Set([...(a?.gpLinks || []), ...accepted])];
+    await saveAccount(name, { gpLinks: merged });
+    await bot.telegram.sendMessage(ADMIN_ID, `🏁 ${name} GP join အားလုံးပြီးပါပြီ။ သိမ်းထားသော GP: ${merged.length} ခု`);
+  }
+  const refreshed = await accounts();
+  await bot.telegram.sendMessage(ADMIN_ID, await readiness(), readyButtons(refreshed));
+}
+function readyButtons(list) {
+  const rows = list.map((a, i) => !(a.gpLinks || []).length ? [Markup.button.callback(`Add GP Acc${i + 1}`, `ready:addgp:${i}`)] : [] ).filter(r => r.length);
+  rows.push([Markup.button.callback("Back", "menu:main")]);
+  return Markup.inlineKeyboard(rows);
 }
 
 bot.use(async (ctx, next) => {
@@ -257,12 +275,16 @@ bot.action("menu:add", adminOnly, async ctx => {
   if (list.length >= MAX_ACCOUNTS) return tell(ctx, "⚠️ Account ထည့်နိုင်သည့် အများဆုံးအရေအတွက် 10 ခု ပြည့်သွားပါပြီ။", backButton());
   setState("add_session"); await tell(ctx, "Account session ကို ရိုးရိုးစာသား သို့မဟုတ် `.txt` file အဖြစ် ပို့ပါ။ Bot က စစ်ဆေးပြီး ချိတ်ဆက်ပေးမည်။", cancelButton());
 });
-bot.action("menu:list", adminOnly, async ctx => {
+function accountListKeyboard() { return Markup.inlineKeyboard([[Markup.button.callback("Remove ACC", "acc:remove")], [Markup.button.callback("Replace ACC", "acc:replace")], [Markup.button.callback("Back", "menu:main")]]); }
+async function sendAccountList(ctx) {
   const list = await accounts();
-  if (!list.length) return tell(ctx, "📭 Account မရှိသေးပါ။", backButton());
-  return tell(ctx, `👤 ACC List\n\n${list.map((a, i) => `${i + 1}. ${a.name} — ${clients.has(a.name) ? "Connected" : "Disconnected"}`).join("\n")}`, backButton());
-});
-bot.action("menu:ready", adminOnly, async ctx => tell(ctx, await readiness(), backButton()));
+  if (!list.length) return tell(ctx, "📭 Account မရှိသေးပါ။", accountListKeyboard());
+  return tell(ctx, `👤 ACC List\n\n${list.map((a, i) => `${i + 1}. ${a.name} — ${clients.has(a.name) ? "Connected" : "Disconnected"}`).join("\n")}`, accountListKeyboard());
+}
+bot.action("menu:list", adminOnly, sendAccountList);
+bot.action("acc:remove", adminOnly, async ctx => { const list = await accounts(); if (!list.length) return tell(ctx, "📭 Account မရှိသေးပါ။", backButton()); setState("remove_acc"); await removeInlineButtons(ctx); return tell(ctx, `ဖယ်ရှားမည့် account နံပါတ်ကို ပို့ပါ။\nဥပမာ: 2 သို့မဟုတ် No2\n\n${list.map((a, i) => `${i + 1}. ${a.name}`).join("\n")}`, Markup.inlineKeyboard([[Markup.button.callback("Cancel ❌", "flow:cancel")], [Markup.button.callback("Back", "menu:list")]])); });
+bot.action("acc:replace", adminOnly, async ctx => { const list = await accounts(); if (!list.length) return tell(ctx, "📭 Account မရှိသေးပါ။", backButton()); setState("replace_index"); await removeInlineButtons(ctx); return tell(ctx, `အစားထိုးမည့် account နံပါတ်ကို ပို့ပါ။\nဥပမာ: 2 သို့မဟုတ် No2\n\n${list.map((a, i) => `${i + 1}. ${a.name}`).join("\n")}`, Markup.inlineKeyboard([[Markup.button.callback("Cancel ❌", "flow:cancel")], [Markup.button.callback("Back", "menu:list")]])); });
+bot.action("menu:ready", adminOnly, async ctx => { const list = await accounts(); return tell(ctx, await readiness(), readyButtons(list)); });
 bot.action("menu:time", adminOnly, async ctx => {
   const list = await accounts(); const lines = [];
   for (const a of list) for (const [i, link] of (a.gpLinks || []).entries()) { const x = await lastSent(a.name, link); lines.push(`${a.name} GP${i + 1}: ${x ? remaining(SEND_COOLDOWN_MS - (Date.now() - new Date(x.sentAt).getTime())) : "ပို့ရန် အသင့်"}`); }
@@ -272,7 +294,8 @@ bot.action("menu:join", adminOnly, async ctx => {
   const list = await accounts(); if (!list.length) return tell(ctx, "⚠️ အရင်ဆုံး Add ACC လုပ်ပါ။", backButton());
   setState("choose_join"); return tell(ctx, "Account ရွေးချယ်ပါ။", Markup.inlineKeyboard([...list.map((a, i) => [Markup.button.callback(`Join Acc${i + 1} GP`, `join:choose:${i}`)]), [Markup.button.callback("Back", "menu:main")]]));
 });
-bot.action(/^join:choose:(\d+)$/, adminOnly, async (ctx) => { const list = await accounts(); const a = list[Number(ctx.match[1])]; if (!a) return; setState("join_links", { name: a.name }); tell(ctx, `${a.name} အတွက် join မည့် GP link များကို comma (,) ခံပြီး ပို့ပါ။`, cancelButton()); });
+bot.action(/^join:choose:(\d+)$/, adminOnly, async (ctx) => { const list = await accounts(); const a = list[Number(ctx.match[1])]; if (!a) return; setState("join_links", { name: a.name }); tell(ctx, `${a.name} အတွက် join မည့် GP link များကို comma (,) ခံပြီး ပို့ပါ။`, Markup.inlineKeyboard([[Markup.button.callback("Cancel ❌", "flow:cancel")], [Markup.button.callback("Back", "menu:join")]])); });
+bot.action(/^ready:addgp:(\d+)$/, adminOnly, async ctx => { const list = await accounts(); const a = list[Number(ctx.match[1])]; if (!a) return; setState("join_links", { name: a.name }); await safeAnswer(ctx, `Add GP Acc${Number(ctx.match[1]) + 1}`); await removeInlineButtons(ctx); return tell(ctx, `${a.name} အတွက် GP link များကို comma (,) ခံပြီး ပို့ပါ။ Join ပြီးလျှင် GP list ထဲသို့ သိမ်းမည်။`, Markup.inlineKeyboard([[Markup.button.callback("Cancel ❌", "flow:cancel")], [Markup.button.callback("Back", "menu:ready")]])); });
 bot.action("menu:msg", adminOnly, async ctx => {
   const list = await accounts();
   const rows = [[Markup.button.callback("Global Msg", "msg:global")], ...list.map((a, i) => [Markup.button.callback(`Edit Acc${i + 1} Msg`, `msg:acc:${i}`)]), [Markup.button.callback("Back", "menu:main")]];
@@ -301,28 +324,45 @@ async function receiveSession(ctx, text) {
   if (!value || value.length < 20 || /^(hello|test|account|session)$/i.test(value)) return tell(ctx, "⚠️ ရိုးရိုးစာသားဖြစ်နေပါသည်။ Telegram session string ကိုသာ ပို့ပါ။", cancelButton());
   try {
     await tell(ctx, "⏳ Connecting...");
-    const client = await buildClient(value); const list = await accounts(); const name = `Acc${list.length + 1}`;
+    const client = await buildClient(value); const state = currentState();
+    if (state?.type === "replace_session") {
+      const list = await accounts(); const old = list[state.index];
+      if (!old) { await client.disconnect().catch(() => {}); clearState(); return tell(ctx, "❌ Replace လုပ်မည့် account မတွေ့ပါ။", mainMenu()); }
+      if (clients.has(old.name)) await clients.get(old.name).disconnect().catch(() => {});
+      await saveAccount(old.name, { sessionString: value, active: true }); clients.set(old.name, client); clearState();
+      return tell(ctx, `✅ ${old.name} ကို account အသစ်ဖြင့် replace လုပ်ပြီး Connected ဖြစ်ပါပြီ။`, mainMenu());
+    }
+    const list = await accounts(); const name = `Acc${list.length + 1}`;
     await saveAccount(name, { name, sessionString: value, active: true, gpLinks: [], customMsg: "", order: list.length, addedAt: new Date() }); clients.set(name, client); clearState(); await tell(ctx, `✅ ${name} Connected`, mainMenu());
   } catch (err) { tell(ctx, `❌ Session မှားနေသည် သို့မဟုတ် ချိတ်ဆက်မရပါ — ${err.message}`, cancelButton()); }
 }
 bot.on("document", adminOnly, async ctx => {
-  const s = currentState(); if (!s || s.type !== "add_session") return;
+  const s = currentState(); if (!s || !["add_session", "replace_session"].includes(s.type)) return;
   try { const f = await ctx.telegram.getFile(ctx.message.document.file_id); const https = require("https"); const data = await new Promise((resolve, reject) => https.get(`https://api.telegram.org/file/bot${BOT_TOKEN}/${f.file_path}`, r => { let x = ""; r.on("data", c => x += c); r.on("end", () => resolve(x)); r.on("error", reject); }).on("error", reject)); await receiveSession(ctx, data); } catch (e) { tell(ctx, `❌ File ဖတ်မရပါ — ${e.message}`, cancelButton()); }
 });
 bot.on("text", adminOnly, async ctx => {
   const s = currentState(); const text = ctx.message.text.trim();
   if (text === "/cancel") { clearState(); return showMenu(ctx); }
+  if (s?.type === "remove_acc" || s?.type === "replace_index") {
+    const match = text.match(/^no?\s*(\d+)$/i);
+    if (!match) return tell(ctx, "⚠️ Account နံပါတ်ကိုသာ ပို့ပါ။ ဥပမာ: 2 သို့မဟုတ် No2", cancelButton());
+    const index = Number(match[1]) - 1; const list = await accounts(); const a = list[index];
+    if (!a) return tell(ctx, `❌ Account ${match[1]} မတွေ့ပါ။ 1 မှ ${list.length} အတွင်း နံပါတ်ပို့ပါ။`, cancelButton());
+    if (s.type === "remove_acc") {
+      clearState();
+      try { if (clients.has(a.name)) { await clients.get(a.name).disconnect().catch(() => {}); clients.delete(a.name); } await deleteAccount(a.name); return tell(ctx, `✅ ${a.name} ကို ဖယ်ရှားပြီးပါပြီ။`, mainMenu()); }
+      catch (err) { return tell(ctx, `❌ Remove မအောင်မြင်ပါ — ${err.message}`, mainMenu()); }
+    }
+    setState("replace_session", { index }); return tell(ctx, `${a.name} ကို အစားထိုးရန် session ကို စာသား သို့မဟုတ် .txt file အဖြစ် ပို့ပါ။`, Markup.inlineKeyboard([[Markup.button.callback("Cancel ❌", "flow:cancel")], [Markup.button.callback("Back", "acc:replace")]]));
+  }
   if (!s) {
     if (text === "Add ACC") {
       const list = await accounts();
       if (list.length >= MAX_ACCOUNTS) return tell(ctx, "⚠️ Account ထည့်နိုင်သည့် အများဆုံးအရေအတွက် 10 ခု ပြည့်သွားပါပြီ။");
       setState("add_session"); return tell(ctx, "Account session ကို ရိုးရိုးစာသား သို့မဟုတ် `.txt` file အဖြစ် ပို့ပါ။ Bot က စစ်ဆေးပြီး ချိတ်ဆက်ပေးမည်။", cancelButton());
     }
-    if (text === "ACC List") {
-      const list = await accounts();
-      return tell(ctx, list.length ? `👤 ACC List\\n\\n${list.map((a, i) => `${i + 1}. ${a.name} — ${clients.has(a.name) ? "Connected" : "Disconnected"}`).join("\\n")}` : "📭 Account မရှိသေးပါ။", backButton());
-    }
-    if (text === "Ready") return tell(ctx, await readiness(), backButton());
+    if (text === "ACC List") return sendAccountList(ctx);
+    if (text === "Ready") { const list = await accounts(); return tell(ctx, await readiness(), readyButtons(list)); }
     if (text === "Time") {
       const list = await accounts(); const lines = [];
       for (const a of list) for (const [i, link] of (a.gpLinks || []).entries()) { const x = await lastSent(a.name, link); lines.push(`${a.name} GP${i + 1}: ${x ? remaining(SEND_COOLDOWN_MS - (Date.now() - new Date(x.sentAt).getTime())) : "ပို့ရန် အသင့်"}`); }
@@ -346,7 +386,7 @@ bot.on("text", adminOnly, async ctx => {
     }
     return;
   }
-  if (s.type === "add_session") return receiveSession(ctx, text);
+  if (s.type === "add_session" || s.type === "replace_session") return receiveSession(ctx, text);
   if (s.type === "join_links") { clearState(); const links = parseLinks(text); if (!links.length) return tell(ctx, "⚠️ GP link မတွေ့ပါ။", cancelButton()); tell(ctx, `🚀 ${s.name} join စတင်မည် — GP ${links.length} ခု`); return runJoin(s.name, links); }
   if (s.type === "global_msg") { await saveSettings({ globalMsg: text }); clearState(); return tell(ctx, "✅ Global message သိမ်းပြီးပါပြီ။", mainMenu()); }
   if (s.type === "acc_msg") { await saveAccount(s.name, { customMsg: text }); clearState(); return tell(ctx, `✅ ${s.name} message သိမ်းပြီးပါပြီ။`, mainMenu()); }
