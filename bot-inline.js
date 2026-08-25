@@ -18,11 +18,12 @@ const GP_DELAY_MS = 6000;
 const SEND_COOLDOWN_MS = 15 * 60 * 1000;
 const STOP_COOLDOWN_MS = 20 * 60 * 1000;
 
-if (!BOT_TOKEN || !API_ID || !API_HASH || !ADMIN_ID || !MONGO_URI || !SESSION_ENCRYPTION_KEY) {
-  throw new Error("BOT_TOKEN, API_ID, API_HASH, ADMIN_ID, MONGO_URI and SESSION_ENCRYPTION_KEY are required");
+if (!BOT_TOKEN || !API_ID || !API_HASH || !ADMIN_ID || !MONGO_URI) {
+  throw new Error("BOT_TOKEN, API_ID, API_HASH, ADMIN_ID and MONGO_URI are required");
 }
-const KEY = crypto.createHash("sha256").update(SESSION_ENCRYPTION_KEY).digest();
+const KEY = SESSION_ENCRYPTION_KEY ? crypto.createHash("sha256").update(SESSION_ENCRYPTION_KEY).digest() : null;
 function encrypt(value) {
+  if (!KEY) return String(value);
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv("aes-256-gcm", KEY, iv);
   const encrypted = Buffer.concat([cipher.update(String(value), "utf8"), cipher.final()]);
@@ -30,6 +31,7 @@ function encrypt(value) {
 }
 function decrypt(value) {
   if (!value) return "";
+  if (!KEY) return String(value);
   const [ivB64, tagB64, dataB64] = String(value).split(".");
   if (!ivB64 || !tagB64 || !dataB64) return String(value);
   try {
@@ -38,7 +40,7 @@ function decrypt(value) {
     return Buffer.concat([decipher.update(Buffer.from(dataB64, "base64url")), decipher.final()]).toString("utf8");
   } catch { throw new Error("Encrypted account data cannot be decrypted; check SESSION_ENCRYPTION_KEY"); }
 }
-function encryptJson(value) { return encrypt(JSON.stringify(value || [])); }
+function encryptJson(value) { return KEY ? encrypt(JSON.stringify(value || [])) : JSON.stringify(value || []); }
 function decryptJson(value) { try { return JSON.parse(decrypt(value)); } catch { return Array.isArray(value) ? value : []; } }
 
 const bot = new Telegraf(BOT_TOKEN);
@@ -68,16 +70,17 @@ async function connectDB() {
 }
 async function accounts() {
   const rows = await db.collection("accounts").find({}).sort({ order: 1, addedAt: 1 }).toArray();
-  return rows.map(a => ({ ...a, sessionString: a.sessionCiphertext ? decrypt(a.sessionCiphertext) : a.sessionString || "", gpLinks: a.gpLinksCiphertext ? decryptJson(a.gpLinksCiphertext) : a.gpLinks || [] }));
+  return rows.map(a => ({ ...a, sessionString: KEY ? (a.sessionCiphertext ? decrypt(a.sessionCiphertext) : a.sessionString || "") : (a.sessionString || ""), gpLinks: KEY ? (a.gpLinksCiphertext ? decryptJson(a.gpLinksCiphertext) : a.gpLinks || []) : (a.gpLinks || []) }));
 }
 async function accountByName(name) { return (await accounts()).find(a => a.name === name) || null; }
 async function saveAccount(name, data) {
   const safe = { ...data };
-  if (Object.prototype.hasOwnProperty.call(safe, "sessionString")) { safe.sessionCiphertext = encrypt(safe.sessionString); delete safe.sessionString; }
-  if (Object.prototype.hasOwnProperty.call(safe, "gpLinks")) { safe.gpLinksCiphertext = encryptJson(safe.gpLinks); delete safe.gpLinks; }
-  return db.collection("accounts").updateOne({ name }, { $set: safe, $unset: { sessionString: "", gpLinks: "" } }, { upsert: true });
+  if (Object.prototype.hasOwnProperty.call(safe, "sessionString")) { if (KEY) { safe.sessionCiphertext = encrypt(safe.sessionString); delete safe.sessionString; } }
+  if (Object.prototype.hasOwnProperty.call(safe, "gpLinks")) { if (KEY) { safe.gpLinksCiphertext = encryptJson(safe.gpLinks); delete safe.gpLinks; } }
+  return db.collection("accounts").updateOne({ name }, { $set: safe, ...(KEY ? { $unset: { sessionString: "", gpLinks: "" } } : {}) }, { upsert: true });
 }
 async function migrateLegacyAccountData() {
+  if (!KEY) return;
   const rows = await db.collection("accounts").find({}).toArray();
   for (const row of rows) {
     const patch = {};
