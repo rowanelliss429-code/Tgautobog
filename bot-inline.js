@@ -4,6 +4,7 @@ const { StringSession } = require("telegram/sessions");
 const { Api } = require("telegram/tl");
 const { MongoClient } = require("mongodb");
 const crypto = require("crypto");
+const { AsyncLocalStorage } = require("async_hooks");
 require("dotenv").config();
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -52,7 +53,12 @@ const bot = new Telegraf(BOT_TOKEN);
 let db;
 const clients = new Map();
 const states = new Map();
+const activeJoins = new Set();
+const adminContext = new AsyncLocalStorage();
+const currentAdminId = () => adminContext.getStore() || ADMIN_ID;
 let job = null;
+const pendingSendQueue = [];
+const accountOps = new Set();
 let repeatTimer = null;
 let scheduledNames = [];
 let stopRequested = false;
@@ -124,10 +130,13 @@ async function showMenu(ctx, text = "Main Menu") {
   }
   return ctx.reply(text, mainMenu()).catch(() => {});
 }
-async function tell(ctx, text, extra = {}) { return ctx.reply(text, extra); }
-function setState(type, data = {}) { states.set(ADMIN_ID, { type, ...data }); }
-function clearState() { states.delete(ADMIN_ID); }
-function currentState() { return states.get(ADMIN_ID); }
+async function tell(ctx, text, extra = {}) { return ctx.reply(text, extra).catch(err => console.error("Reply error:", err.message)); }
+async function notifyAdmins(text, extra = {}) {
+  await Promise.allSettled(ADMIN_IDS.map(id => bot.telegram.sendMessage(id, text, extra).catch(err => console.error(`Notification error for ${id}:`, err.message))));
+}
+function setState(type, data = {}) { states.set(currentAdminId(), { type, ...data }); }
+function clearState() { states.delete(currentAdminId()); }
+function currentState() { return states.get(currentAdminId()); }
 function pickMessage(text) { return String(text).split("{spin}")[Math.floor(Math.random() * String(text).split("{spin}").length)].trim(); }
 function floodWaitSeconds(err) {
   return Number(err?.seconds || err?.value || String(err?.message || "").match(/FLOOD_WAIT[_ ]?(\d+)/i)?.[1] || 0);
@@ -173,8 +182,12 @@ async function readiness() {
 }
 
 async function runSend(names) {
-  if (job) return;
-  if (Date.now() < cooldownUntil) { await bot.telegram.sendMessage(ADMIN_ID, `⏳ Cooldown ရှိနေသေးသည် — ${remaining(cooldownUntil - Date.now())}`); return; }
+  if (job) {
+    if (!pendingSendQueue.some(item => item.names.join(",") === names.join(","))) pendingSendQueue.push({ names: [...names] });
+    await notifyAdmins(`⏳ အခြား admin ၏ auto-send လုပ်နေဆဲဖြစ်သောကြောင့် ${names.join(", ")} ကို queue ထဲထည့်ထားပါသည်။ လက်ရှိအလုပ်မပျက်ပါ။`);
+    return;
+  }
+  if (Date.now() < cooldownUntil) { await notifyAdmins( `⏳ Cooldown ရှိနေသေးသည် — ${remaining(cooldownUntil - Date.now())}`); return; }
   job = { names, startedAt: Date.now() };
   stopRequested = false;
   try {
@@ -182,58 +195,68 @@ async function runSend(names) {
     for (const name of names) {
       const a = await accountByName(name);
       const client = clients.get(name);
-      if (!a || !client) { await bot.telegram.sendMessage(ADMIN_ID, `⚠️ ${name} Connected မဟုတ်ပါ`); continue; }
+      if (!a || !client) { await notifyAdmins( `⚠️ ${name} Connected မဟုတ်ပါ`); continue; }
+      if (accountOps.has(name)) { await notifyAdmins(`⏳ ${name} ကို အခြားလုပ်ဆောင်ချက်တစ်ခုက အသုံးပြုနေသဖြင့် ဒီ cycle မှာ skip လုပ်ပါမယ်။`); continue; }
+      accountOps.add(name);
       const msg = a.customMsg || global;
       const gps = a.gpLinks || [];
-      if (!msg || !gps.length) { await bot.telegram.sendMessage(ADMIN_ID, `⏭ ${name}: GP သို့မဟုတ် message မရှိပါ`); continue; }
+      if (!msg || !gps.length) { accountOps.delete(name); await notifyAdmins( `⏭ ${name}: GP သို့မဟုတ် message မရှိပါ`); continue; }
       for (let i = 0; i < gps.length; i++) {
         if (stopRequested) throw new Error("STOP_REQUESTED");
         const link = gps[i];
         try {
           const old = await lastSent(name, link);
           if (old && Date.now() - new Date(old.sentAt).getTime() < SEND_COOLDOWN_MS) {
-            await bot.telegram.sendMessage(ADMIN_ID, `⏭ ${name} GP${i + 1} — 15 မိနစ်မပြည့်သေးပါ`);
+            await notifyAdmins( `⏭ ${name} GP${i + 1} — 15 မိနစ်မပြည့်သေးပါ`);
           } else {
             await sendOne(client, link, pickMessage(msg));
             await markSent(name, link);
-            await bot.telegram.sendMessage(ADMIN_ID, `✅ ${name} GP${i + 1} ပို့ပြီးပါပြီ`);
+            await notifyAdmins( `✅ ${name} GP${i + 1} ပို့ပြီးပါပြီ`);
           }
         } catch (err) {
           const wait = floodWaitSeconds(err);
           if (wait) {
-            await bot.telegram.sendMessage(ADMIN_ID, `⏳ Telegram က ${wait} စက္ကန့်စောင့်ခိုင်းနေပါသည်။ ပြီးမှ ဆက်ပို့မည်။`);
+            await notifyAdmins( `⏳ Telegram က ${wait} စက္ကန့်စောင့်ခိုင်းနေပါသည်။ ပြီးမှ ဆက်ပို့မည်။`);
             await sleep(wait * 1000);
             i--;
             continue;
           }
-          await bot.telegram.sendMessage(ADMIN_ID, `❌ ${name} GP${i + 1} မအောင်မြင်ပါ — ${err.message}`);
+          await notifyAdmins( `❌ ${name} GP${i + 1} မအောင်မြင်ပါ — ${err.message}`);
         }
         if (i < gps.length - 1) await sleep(GP_DELAY_MS);
       }
-      await bot.telegram.sendMessage(ADMIN_ID, `📌 ${name} ပြီးပါပြီ။ နောက်တစ်ကြိမ်ပို့ရန် 15 မိနစ်နားမည်။`);
+      await notifyAdmins( `📌 ${name} ပြီးပါပြီ။ နောက်တစ်ကြိမ်ပို့ရန် 15 မိနစ်နားမည်။`);
+      accountOps.delete(name);
     }
-  } catch (err) { if (err.message === "STOP_REQUESTED") await bot.telegram.sendMessage(ADMIN_ID, "⏹️ ပို့နေမှု ရပ်လိုက်ပါပြီ"); else console.error(err); }
-  finally {
+  } catch (err) { if (err.message === "STOP_REQUESTED") await notifyAdmins( "⏹️ ပို့နေမှု ရပ်လိုက်ပါပြီ"); else { console.error("Send job error:", err); await notifyAdmins("❌ Send process တွင် error ဖြစ်သော်လည်း bot ဆက်လက် run နေပါသည်။"); }   } finally {
+    accountOps.clear();
     job = null;
+    const next = pendingSendQueue.shift();
+    if (next) setTimeout(() => runSend(next.names).catch(err => console.error("Queued send error:", err.message)), 0);
     if (!stopRequested && Date.now() >= cooldownUntil && scheduledNames.length) {
       repeatTimer = setTimeout(() => runSend(scheduledNames), SEND_COOLDOWN_MS);
-      await bot.telegram.sendMessage(ADMIN_ID, "⏰ 15 မိနစ်ပြည့်လျှင် auto-send ပြန်စမည်။");
+      await notifyAdmins( "⏰ 15 မိနစ်ပြည့်လျှင် auto-send ပြန်စမည်။");
     }
     stopRequested = false;
   }
 }
 
 async function runJoin(name, links) {
+  if (activeJoins.has(name)) return notifyAdmins(`⚠️ ${name} အတွက် join လုပ်နေပြီးသားဖြစ်ပါသည်။ လက်ရှိလုပ်ဆောင်ချက် မပျက်ဘဲ ဆက်လက်လုပ်နေပါသည်။`);
+  activeJoins.add(name);
+  try { return await runJoinUnsafe(name, links); } finally { activeJoins.delete(name); }
+}
+async function runJoinUnsafe(name, links) {
   const client = clients.get(name);
-  if (!client) return bot.telegram.sendMessage(ADMIN_ID, `❌ ${name} Connected မဟုတ်ပါ`);
+  if (!client) return notifyAdmins( `❌ ${name} Connected မဟုတ်ပါ`);
   const accepted = [];
   for (let i = 0; i < links.length; i++) {
-    try { await joinOne(client, links[i]); accepted.push(links[i]); await bot.telegram.sendMessage(ADMIN_ID, `✅ ${name} GP${i + 1} ပြီးပါပြီ`); }
+    try { await joinOne(client, links[i]); accepted.push(links[i]); await notifyAdmins( `✅ ${name} GP${i + 1} ပြီးပါပြီ`); }
     catch (err) {
       const wait = floodWaitSeconds(err);
-      if (wait) { await bot.telegram.sendMessage(ADMIN_ID, `⏳ Telegram အမိန့်အတိုင်း ${wait} စက္ကန့်စောင့်ပြီး ဆက်လုပ်မည်`); await sleep(wait * 1000); i--; continue; }
-      if (/already|PARTICIPANT/i.test(err.message)) { accepted.push(links[i]); await bot.telegram.sendMessage(ADMIN_ID, `ℹ️ ${name} GP${i + 1} ဝင်ပြီးသားပါ`); }
-      else await bot.telegram.sendMessage(ADMIN_ID, `❌ ${name} GP${i + 1} မအောင်မြင်ပါ — ${err.message}`);
+      if (wait) { await notifyAdmins( `⏳ Telegram အမိန့်အတိုင်း ${wait} စက္ကန့်စောင့်ပြီး ဆက်လုပ်မည်`); await sleep(wait * 1000); i--; continue; }
+      if (/already|PARTICIPANT/i.test(err.message)) { accepted.push(links[i]); await notifyAdmins( `ℹ️ ${name} GP${i + 1} ဝင်ပြီးသားပါ`); }
+      else await notifyAdmins( `❌ ${name} GP${i + 1} မအောင်မြင်ပါ — ${err.message}`);
     }
     if (i < links.length - 1) await sleep(GP_DELAY_MS);
   }
@@ -241,10 +264,10 @@ async function runJoin(name, links) {
     const a = await accountByName(name);
     const merged = [...new Set([...(a?.gpLinks || []), ...accepted])];
     await saveAccount(name, { gpLinks: merged });
-    await bot.telegram.sendMessage(ADMIN_ID, `🏁 ${name} GP join အားလုံးပြီးပါပြီ။ သိမ်းထားသော GP: ${merged.length} ခု`);
+    await notifyAdmins( `🏁 ${name} GP join အားလုံးပြီးပါပြီ။ သိမ်းထားသော GP: ${merged.length} ခု`);
   }
   const refreshed = await accounts();
-  await bot.telegram.sendMessage(ADMIN_ID, await readiness(), readyButtons(refreshed));
+  await notifyAdmins( await readiness(), readyButtons(refreshed));
 }
 function readyButtons(list) {
   const rows = list.map((a, i) => !(a.gpLinks || []).length ? [Markup.button.callback(`Add GP Acc${i + 1}`, `ready:addgp:${i}`)] : [] ).filter(r => r.length);
@@ -254,7 +277,7 @@ function readyButtons(list) {
 
 bot.use(async (ctx, next) => {
   try { await safeAnswer(ctx); } catch (_) {}
-  return next();
+  return adminContext.run(Number(ctx.from?.id) || ADMIN_ID, () => next());
 });
 bot.catch((err, ctx) => { console.error("Telegram handler error", { updateId: ctx.update?.update_id, message: err.message, stack: err.stack }); });
 process.on("unhandledRejection", err => console.error("Unhandled promise rejection", err));
@@ -407,7 +430,7 @@ require("http").createServer((_, res) => { res.writeHead(200); res.end("GP Bot O
   await bot.telegram.deleteWebhook({ drop_pending_updates: true });
   await bot.launch({ dropPendingUpdates: true });
   console.log("[startup] long polling started; waiting for updates");
-  await bot.telegram.sendMessage(ADMIN_ID, "✅ Button GP Bot အသင့်ဖြစ်ပြီ။ /start နိပ်ပါ");
+  await notifyAdmins( "✅ Button GP Bot အသင့်ဖြစ်ပြီ။ /start နိပ်ပါ");
 })().catch(err => { console.error("[startup] FAILED:", err.stack || err.message); process.exitCode = 1; });
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
