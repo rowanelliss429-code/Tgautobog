@@ -18,8 +18,12 @@ const GP_DELAY_MS = 6000;
 const SEND_COOLDOWN_MS = 15 * 60 * 1000;
 const STOP_COOLDOWN_MS = 20 * 60 * 1000;
 
-if (!BOT_TOKEN || !API_ID || !API_HASH || !ADMIN_ID || !MONGO_URI) {
-  throw new Error("BOT_TOKEN, API_ID, API_HASH, ADMIN_ID and MONGO_URI are required");
+const missingEnv = [
+  ["BOT_TOKEN", BOT_TOKEN], ["API_ID", API_ID], ["API_HASH", API_HASH],
+  ["ADMIN_ID", ADMIN_ID], ["MONGO_URI", MONGO_URI]
+].filter(([, value]) => value === undefined || value === null || value === "" || (typeof value === "number" && !Number.isFinite(value))).map(([name]) => name);
+if (missingEnv.length) {
+  throw new Error(`Missing Render Environment Variables: ${missingEnv.join(", ")}`);
 }
 const KEY = SESSION_ENCRYPTION_KEY ? crypto.createHash("sha256").update(SESSION_ENCRYPTION_KEY).digest() : null;
 function encrypt(value) {
@@ -89,7 +93,7 @@ async function migrateLegacyAccountData() {
     if (Object.keys(patch).length) await saveAccount(row.name, patch);
   }
 }
-const settings = () => db.collection("settings").findOne({ _id: "main" }) || {};
+const settings = async () => (await db.collection("settings").findOne({ _id: "main" })) || {};
 const saveSettings = data => db.collection("settings").updateOne({ _id: "main" }, { $set: data }, { upsert: true });
 
 function mainMenu() {
