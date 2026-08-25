@@ -9,7 +9,8 @@ require("dotenv").config();
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const API_ID = Number(process.env.API_ID);
 const API_HASH = process.env.API_HASH;
-const ADMIN_ID = Number(process.env.ADMIN_ID);
+const ADMIN_IDS = String(process.env.ADMIN_IDS || process.env.ADMIN_ID || "").split(",").map(x => Number(x.trim())).filter(Number.isSafeInteger);
+const ADMIN_ID = ADMIN_IDS[0];
 const MONGO_URI = process.env.MONGO_URI;
 const SESSION_ENCRYPTION_KEY = process.env.SESSION_ENCRYPTION_KEY;
 const PORT = Number(process.env.PORT || 3000);
@@ -20,8 +21,8 @@ const STOP_COOLDOWN_MS = 20 * 60 * 1000;
 
 const missingEnv = [
   ["BOT_TOKEN", BOT_TOKEN], ["API_ID", API_ID], ["API_HASH", API_HASH],
-  ["ADMIN_ID", ADMIN_ID], ["MONGO_URI", MONGO_URI]
-].filter(([, value]) => value === undefined || value === null || value === "" || (typeof value === "number" && !Number.isFinite(value))).map(([name]) => name);
+  ["ADMIN_ID or ADMIN_IDS", ADMIN_IDS.length > 0], ["MONGO_URI", MONGO_URI]
+].filter(([, value]) => value === false || value === undefined || value === null || value === "" || (typeof value === "number" && !Number.isFinite(value))).map(([name]) => name);
 if (missingEnv.length) {
   throw new Error(`Missing Render Environment Variables: ${missingEnv.join(", ")}`);
 }
@@ -59,10 +60,10 @@ let stopPresses = 0;
 let lastStopAt = 0;
 let cooldownUntil = 0;
 
-const isAdmin = ctx => Number(ctx.from?.id) === ADMIN_ID;
+const isAdmin = ctx => ADMIN_IDS.includes(Number(ctx.from?.id));
 const adminOnly = async (ctx, next) => {
   if (isAdmin(ctx)) return next();
-  console.warn(`Unauthorized Telegram user ${ctx.from?.id}; configured ADMIN_ID=${ADMIN_ID}`);
+  console.warn(`Unauthorized Telegram user ${ctx.from?.id}; configured ADMIN_IDS=${ADMIN_IDS.join(",")}`);
   if (ctx.message?.text === "/start" || ctx.callbackQuery) await ctx.reply("ဒီ bot ကို admin account သာ အသုံးပြုနိုင်ပါသည်။").catch(() => {});
 };
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -398,7 +399,7 @@ require("http").createServer((_, res) => { res.writeHead(200); res.end("GP Bot O
   await connectDB();
   console.log("[startup] MongoDB connected; checking Telegram token...");
   const me = await bot.telegram.getMe();
-  console.log(`[startup] Telegram bot @${me.username} ready; ADMIN_ID=${ADMIN_ID}`);
+  console.log(`[startup] Telegram bot @${me.username} ready; ADMIN_IDS=${ADMIN_IDS.join(",")}`);
   await migrateLegacyAccountData();
   const s = await settings();
   await loadClients();
